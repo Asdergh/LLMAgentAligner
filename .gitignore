@@ -2,3 +2,4 @@ venv/
 test.*
 html.*
 folder_size.py
+db_tests/

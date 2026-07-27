@@ -2,9 +2,11 @@ import torch as th
 import torch.nn as nn
 import transformers as tfs
 import transformers.modeling_utils as tfm
-from typing import (Optional, Callable, Dict, List)
+from typing import (Optional, Callable, Dict, List, Tuple)
 from warnings import warn
 from functools import wraps
+from dataclasses import dataclass
+from torchtyping import TensorType
 
 from .attention import (_ATTENTION_SCORING_FUNCTIONS_, MultiHeadAttention)
 
@@ -72,6 +74,8 @@ class Residual(nn.Module):
     
     def forward(self, x: th.Tensor):
         x_out = self.flow(x)
+        if isinstance(x_out, BlockOutput):
+            x_out = x_out.features
         if x_out.shape == x.shape:
             return x + x_out
         else:
@@ -89,36 +93,107 @@ class FiltrationBlock(nn.Module):
         shift = shift.view(*x.shape[:-1], -1)
         return (scale * x) + shift
 
+
+@dataclass
+class BlockOutput:
+    features: th.Tensor
+    attention_kv: Tuple[th.Tensor, th.Tensor]
+
+@dataclass 
+class BlockStackOutput:
+    hidden_features: Tuple[th.Tensor]
+    attention_kv_features: Tuple[Tuple[th.Tensor, th.Tensor]]
+
 class Block(nn.Module):
+    def __init__(self, features: int,
+                 dropout: float=0.0,
+                 activation: str="gelu",
+                 attention_heads: int=3,
+                 attention_reduction: str="w-sum",
+                 attention_scroring_fn: str="scaled-dot-product",
+                 filtration: bool=True):
+        
+        super(Block, self).__init__()
+        self.fcin = Mlp(features, None, dropout, activation)
+        self.fcout = Mlp(features, None, dropout, activation)
+        self.attention = MultiHeadAttention(features,
+                                            nheads=attention_heads,
+                                            scoring_fn=attention_scroring_fn,
+                                            heads_reduction=attention_reduction)
+        if filtration:
+            self.film = FiltrationBlock(features)
+    
+    def forward(self, x: th.Tensor, use_cache: bool=False):
+        x = self.fcin(x)
+        x, KV = self.attention(x, use_cache=use_cache)
+        x = self.fcout(x)
+        if hasattr(self, "film"):
+            x = self.film(x)
+        
+        return BlockOutput(x, KV)
+    
+class BlockStack(nn.Module):
     def __init__(self, features: int,
                  depth: int=3,
                  dropout: float=0.0,
+                 actiavtion: str="gelu",
                  filtration: bool=True,
                  n_attn_heads: int=4,
                  attention_reduction: str="w-sum",
                  attention_scoring_fn: str="scaled-dot-product",
                  residual_connections: bool=False):
         
-        super(Block, self).__init__()
+        super(BlockStack, self).__init__()
         self.blocks: List[nn.Module] = []
         for _ in range(depth):
-            block = nn.Sequential(Mlp(features, None, dropout, "identity"),
-                                MultiHeadAttention(features,
-                                                   nheads=n_attn_heads,
-                                                   scoring_fn=attention_scoring_fn,
-                                                   heads_reduction=attention_reduction),
-                                Mlp(features, None, dropout, "identity"))
-            if filtration:
-                block.append(FiltrationBlock(features))
+            block = Block(features,
+                          dropout,
+                          actiavtion,
+                          n_attn_heads,
+                          attention_reduction,
+                          attention_scoring_fn,
+                          filtration)
             if residual_connections:
                 block = Residual(block)
             self.blocks.append(block)
         self.blocks = nn.ModuleList(self.blocks)
     
     def forward(self, x: th.Tensor):
+        hidden_features = []
+        attention_KV = []
         for block in self.blocks:
             x = block(x)
-        return x
+            (x, KV) = (x.features, x.attention_kv)
+            hidden_features.append(x)
+            attention_KV.append(KV)
+        return BlockStackOutput(tuple(hidden_features),
+                                tuple(attention_KV))
+
+
+class FusionEnterBlock(nn.Module):
+    def __init__(self, text_features: int,
+                 dynamic_features: int,
+                 features: int,
+                 use_mixed_values: bool=True):
+        super(FusionEnterBlock, self).__init__()
+        linear = lambda f: nn.Sequential(nn.Linear(f, features), nn.LayerNorm(features))
+        (self.net_text, self.net_signal) = tuple(linear(f) for f in [text_features, dynamic_features])
+        if use_mixed_values:
+            self.net_mix = linear(text_features + dynamic_features)
+        self.attention = MultiHeadAttention(features, 1, "scaled-dot-product", "w-sum")
+    
+    def forward(self, text_embeds: TensorType["B", "S", "C"],
+                signal_embeds: TensorType["B", "S", "C"],
+                mask: Optional[TensorType["B", "S", "S"]]=None):
+        x_text = self.net_text(text_embeds)
+        x_signal = self.net_signal(signal_embeds)
+        x_mix = None
+        if hasattr(self, "net_mix"):
+            x_mix = th.cat([text_embeds, signal_embeds], dim=-1)
+            x_mix = self.net_mix(x_mix)
+        attention = self.attention(x_text, x_signal, x_mix, mask=mask)
+        return attention
+    
 
 if __name__ == "__main__":
 
@@ -130,10 +205,11 @@ if __name__ == "__main__":
     k = th.normal(0, 1, (B, S, FEATURES))
     v = th.normal(0, 1, (B, S, FEATURES))
     
-    block = Block(FEATURES, n_attn_heads=ATTN_HEADS,
+    block = BlockStack(FEATURES, n_attn_heads=ATTN_HEADS,
                   dropout=0.45)
     Nparams = sum([p.numel() for p in block.parameters()])
     x = block(q)
+    x = x.hidden_features[-1]
     print(f"Total params count: {Nparams}")
     print(x.shape, x.mean())
 
