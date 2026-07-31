@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from functools import wraps
 from typing import (Optional, Dict, Any, Literal, Tuple)
 from torchtyping import TensorType
+from transformers.cache_utils import Cache, DynamicCache
 
 
 _ATTENTION_SCORING_FUNCTIONS_: Dict[str, nn.Module] = {}
@@ -103,8 +104,7 @@ class AdditiveAttention(BaseAttenionScoring):
         print(self.qnet(query).size(), self.knet(keys).size())
         QK = F.tanh(self.qnet(query) + self.knet(keys))
         scores = (self.projection\
-            .view(1, 1, 1, self.d_model)\
-            .repeat(1, 1, S, 1) @ QK.transpose(-1, -2))
+            .view(1, 1, 1, self.d_model) @ QK.transpose(-1, -2))
         if mask is not None:
             self._check_mask(query, keys, mask)
             scores.masked_fill_(mask.unsqueeze(dim=1), -1e9)
@@ -118,9 +118,13 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, features: int,
                  nheads: int,
                  scoring_fn: str="scaled-dot-product",
-                 heads_reduction: Literal["sum", "mean", "w-sum"]="w-sum"):
+                 heads_reduction: Literal["sum", "mean", "w-sum"]="w-sum",
+                 layer_idx: Optional[int]=None):
         
         super(MultiHeadAttention, self).__init__()
+        assert (features % nheads) == 0, \
+        (f"features dim: {features} must be dividable by nheads: {nheads}")
+        self.layer_idx = layer_idx
         self.d = features
         self.nh = nheads
         self.d_model = int(features // nheads)
@@ -154,21 +158,25 @@ class MultiHeadAttention(nn.Module):
                 keys: Optional[TensorType["B", "S", "C"]]=None,
                 values: Optional[TensorType["B", "S", "C"]]=None,
                 mask: Optional[TensorType["B", "S", "S"]]=None,
-                pastKV: Optional[Tuple[TensorType["B", "nh", "S", "C"], 
-                                        TensorType["B", "nh", "S", "C"]]]=None,
-                use_cache: bool=False):
+                use_cache: bool=False,
+                past_key_values: Optional[Cache]=None,
+                cache_position: Optional[th.LongTensor]=None):
         keys = (keys if keys is not None else x)
         values = (values if values is not None else keys)
         Q = self._split_heads(self.qnet(x))
         K = self._split_heads(self.knet(keys))
         V = self._split_heads(self.vnet(values))
-        if pastKV is not None:
-            (K_past, V_past) = pastKV
-            K = th.cat([K_past, K], dim=2)
-            V = th.cat([V_past, V], dim=2)
+        present_key_values = None
+        if use_cache:
+            if past_key_values is None:
+                past_key_values = DynamicCache()
+            (K, V) = K.transpose(1, 2), V.transpose(1, 2)
+            (K, V) = past_key_values.update(K, V, self.layer_idx, 
+                                            {"cache_position": cache_position})
+            (K, V) = K.transpose(1, 2), V.transpose(1, 2)
+            present_key_values = past_key_values
 
         attention = self.scoring(Q, K, V, mask=mask)
         attention = self._merge_heads(attention)
         attention = self.projection(attention)
-        presentKV = (K, V) if use_cache else None
-        return attention, presentKV
+        return attention, present_key_values
