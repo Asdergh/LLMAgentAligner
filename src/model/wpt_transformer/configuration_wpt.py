@@ -9,6 +9,7 @@ class WeightedPerceptualTransferConfig(PretrainedConfig):
                 in_channels:         int=1,
                 out_channels:        int=1,
                 time_chunk_size:     int=32,
+                tinterpolation_size: int=100,
                 image_size:          Union[int, Tuple[int, int]]=224,
                 visual_features:     int=364,
                 patch_size:          Union[int, Tuple[int]]=14,
@@ -24,12 +25,13 @@ class WeightedPerceptualTransferConfig(PretrainedConfig):
                 attention_heads:     int=4,
                 signal_splits_n:     int=5,
                 skip_connections:    bool=False,
-                 **kwargs):
+                **kwargs):
 
         self.ode_solver = ode_solver
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.time_chunk_size = time_chunk_size
+        self.tinterpolation_size = tinterpolation_size
         self.image_size = image_size if isinstance(image_size, tuple) else (image_size, image_size)
         self.lfeatures = latent_features
         self.vfeatures = visual_features
