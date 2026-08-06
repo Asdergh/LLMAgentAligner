@@ -15,7 +15,6 @@ from transformers.utils import ModelOutput
 
 
 #============================Perceptual Fusion Modeling Part=============================================================
-
 class FlowFunction(nn.Module):
     def __init__(self, config: WeightedPerceptualTransferConfig):
         super(FlowFunction, self).__init__()
@@ -156,7 +155,6 @@ class FuseChannelsHead(nn.Module):
         self.projection = Mlp(config.vfeatures, config.out_channels, 0.0, "relu")
         self.norm = FiltrationBlock(config.out_channels)
         self.register_buffer("channels_gates", th.zeros((config.out_channels)))
-
 
     def _peak_estimation(self, svalues: TensorType["B", "T", "S", "C"]):
         svalues = svalues * self.channels_gates.view(1, 1, 1, -1)
@@ -311,20 +309,17 @@ class VisualTransformer(nn.Module):
 #============================ViT Modelling Part=============================================================
 
 
-
 @dataclass 
-class WPTOutput:
+class WPTOutput(ModelOutput):
+    loss:                  Optional[th.FloatTensor]=None
     patch_tokens:          Optional[th.Tensor]=None
     cls_token:             Optional[th.Tensor]=None
     intermediates:         Optional[th.Tensor]=None
     temporal_cls_tokens:   Optional[th.Tensor]=None
     channels_output:       Optional[th.Tensor]=None
     
+    
 
-class TemporalTrnasformerDequeue:
-    def __init__(self, size: int):
-        self.size = size
-        self.dequeue = None
 
 class WeightedPerceptualTransferModel(PreTrainedModel):
     def __init__(self, config: WeightedPerceptualTransferConfig):
@@ -347,7 +342,7 @@ class WeightedPerceptualTransferModel(PreTrainedModel):
 if __name__ == "__main__":
     config = WeightedPerceptualTransferConfig(in_channels=3, 
                                             out_channels=13,
-                                            visual_features=556,
+                                            visual_features=312,
                                             image_size=448,
                                             time_chunk_size=54)
     # tgrid = TransferInterpolationBlock(config)
@@ -358,7 +353,7 @@ if __name__ == "__main__":
     print(f"Ntotal: {sum([p.numel() for p in model.parameters()])}")
     data = th.normal(0, 1, (10, 3, 448, 448))
     times = th.linspace(0, 1, 1000)
-    times = times[None, :].repeat(10, 1)
+    # times = times[None, :].repeat(10, 1)
     out = model(data, times)
     print(out.patch_tokens.shape,
         out.temporal_cls_tokens.shape,
