@@ -37,9 +37,9 @@ class BaseAttenionScoring(nn.Module):
         assert mask.shape == (B, Sq, Sk) \
             or mask.shape == (1, Sq, Sk), \
             (f"""{mask.shape=} must be the same in size (B, S, S`).
-             Where B, and S are batch_size and tokens_sequence_lenght
-             corespondeling for query: TensorType['B', 'nh', 'S', 'C'] 
-             and keys: TensorType['B', 'nh', 'S`', 'C']!!!""")
+            Where B, and S are batch_size and tokens_sequence_lenght
+            corespondeling for query: TensorType['B', 'nh', 'S', 'C'] 
+            and keys: TensorType['B', 'nh', 'S`', 'C']!!!""")
         
     def forward(self, query: TensorType["B", "nh", "S", "C"],
                 keys: TensorType["B", "nh", "S", "C"],
@@ -130,8 +130,8 @@ class MultiHeadAttention(nn.Module):
         self.d_model = int(features // nheads)
         self.hreduction = heads_reduction
         self.scoring = get_scoring_fn(scoring_fn, 
-                                      features=features,
-                                      nheads=nheads)
+                                    features=features,
+                                    nheads=nheads)
         if heads_reduction == "w-sum":
             heads_probs = th.zeros((nheads, ))
             self.register_buffer("heads_probs", heads_probs)
