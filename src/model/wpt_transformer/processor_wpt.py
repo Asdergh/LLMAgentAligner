@@ -9,7 +9,7 @@ from typing import (Literal, Tuple, Union)
 from transformers import FeatureExtractionMixin
 
 class PhysicalExplorationModelProcessor(FeatureExtractionMixin):
-    model_input_names = ["spectrograms", "timestampts", "timemask"]
+    model_input_names = ["spectrograms", "timestamps", "timemask"]
     def __init__(self,
                  normalize: bool=False,
                  normalization: Literal["median", "std", "peak"]="median",

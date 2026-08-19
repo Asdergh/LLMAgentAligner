@@ -1,0 +1,15 @@
+2026-08-15 23:18:21,938 - __main__ - INFO - Training started with batch_size=32, lr=0.001
+2026-08-15 23:18:21,938 - __main__ - WARNING - GPU memory usage is high: 85%
+2026-08-15 23:18:21,938 - __main__ - ERROR - Epoch 10: Validation loss increased to 0.543
+2026-08-15 23:18:21,938 - __main__ - CRITICAL - Model crashed - out of memory
+2026-08-15 23:18:21,938 - __main__ - INFO - Epoch 5/100 - loss: 0.234, accuracy: 0.892
+2026-08-15 23:18:21,938 - __main__ - INFO - Epoch 10/100 - loss: 0.198, accuracy: 0.912
+2026-08-15 23:18:21,938 - __main__ - INFO - Training completed successfully
+2026-08-15 23:18:48,127 - __main__ - DEBUG - Debug message - for detailed troubleshooting
+2026-08-15 23:18:48,127 - __main__ - INFO - Training started with batch_size=32, lr=0.001
+2026-08-15 23:18:48,127 - __main__ - WARNING - GPU memory usage is high: 85%
+2026-08-15 23:18:48,127 - __main__ - ERROR - Epoch 10: Validation loss increased to 0.543
+2026-08-15 23:18:48,127 - __main__ - CRITICAL - Model crashed - out of memory
+2026-08-15 23:18:48,127 - __main__ - INFO - Epoch 5/100 - loss: 0.234, accuracy: 0.892
+2026-08-15 23:18:48,127 - __main__ - INFO - Epoch 10/100 - loss: 0.198, accuracy: 0.912
+2026-08-15 23:18:48,127 - __main__ - INFO - Training completed successfully

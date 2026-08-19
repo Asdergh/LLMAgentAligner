@@ -25,6 +25,7 @@ class WeightedPerceptualTransferConfig(PretrainedConfig):
                 attention_heads:     int=4,
                 signal_splits_n:     int=5,
                 skip_connections:    bool=False,
+                n_classes:           Optional[int]=None,  
                 **kwargs):
 
         self.ode_solver = ode_solver
@@ -47,6 +48,7 @@ class WeightedPerceptualTransferConfig(PretrainedConfig):
         self.attention_scoring = attention_scoring
         self.attention_heads = attention_heads
         self.skip = skip_connections
+        self.n_classes = n_classes
         super(WeightedPerceptualTransferConfig, self).__init__(**kwargs)
 
 

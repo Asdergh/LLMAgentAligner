@@ -6,10 +6,11 @@ from queue import Queue
 from .configuration_wpt import WeightedPerceptualTransferConfig
 from ..layers import *
 from ..attention import MultiHeadAttention
-from typing import Any
+from typing import Any, Literal
 from torchdiffeq import odeint_adjoint as odeint
 from transformers import PreTrainedModel
 from transformers.utils import ModelOutput
+from tqdm import tqdm
 
 
 
@@ -36,7 +37,7 @@ class FlowModel(nn.Module):
                     times: th.Tensor,
                     chunk_size: Optional[int]=None):
         if (chunk_size is None) or (chunk_size >= times.shape[0]):
-            return odeint(self.fn, z0, times)
+            return odeint(self.fn, z0, times).transpose(0, 1)
         else:
             zt0 = z0.clone()
             n_chunks = int(times.shape[0] // chunk_size)
@@ -77,11 +78,14 @@ class TransferInterpolationBlock(nn.Module):
         self.register_buffer("time_weights", tweights)
 
     def forward(self, t: TensorType["B", "T"]):
-        if t.ndim == 1 or t.shape[0] == 1:
-            T = t.squeeze().size(0)
+        if t.ndim == 0 or (t.ndim == 1 or t.shape[0] == 1):
+            T = (t.squeeze().size(0) if t.ndim != 0 else 1)
             tgrid = t.view(1, 1, T, 1)
             tgrid = th.cat([tgrid, th.zeros_like(tgrid)], dim=-1)
-            return F.grid_sample(self.time_weights, tgrid).squeeze().transpose(0, 1)
+            sampled = F.grid_sample(self.time_weights, tgrid).squeeze()
+            if sampled.ndim != 1:
+                sampled = sampled.transpose(0, 1)
+            return sampled
         elif t.ndim == 2:
             T = t.size(-1)
             tgrids = []
@@ -105,7 +109,6 @@ class TimeTransferFusion(nn.Module):
                 zt_descrite: TensorType["B", "T", "C"]):
         ztf = self.gate1(zt_flow)
         ztd = self.gate2(zt_descrite)
-        print(ztf.shape, ztd.shape)
         zt_comb = th.cat([ztf, ztd], dim=-1)
         return self.aligner(zt_comb)
 
@@ -131,8 +134,8 @@ class Decoder(nn.Module):
     def __init__(self, config: WeightedPerceptualTransferConfig):
         super(Decoder, self).__init__()
         self.projection = Mlp(features=config.lfeatures,
-                                    out_features=config.vfeatures,
-                                    activation=config.lact_fn)
+                            out_features=config.vfeatures,
+                            activation=config.lact_fn)
         self.norm = FiltrationBlock(config.vfeatures)
 
     def forward(self, x: th.Tensor):
@@ -140,24 +143,27 @@ class Decoder(nn.Module):
         x = self.norm(x)
         return x
 
-@dataclass
-class FuseSignalOutput:
-    fused_features: Optional[th.Tensor]=None
-    signal_values: Optional[th.Tensor]=None
-
 class FuseChannelsHead(nn.Module):
     def __init__(self, config: WeightedPerceptualTransferConfig):
         super(FuseChannelsHead, self).__init__()
+        self.config = config
         pwn = int(config.image_size[0] // config.patch_size[0])
         phn = int(config.image_size[1] // config.patch_size[1])
         pn = pwn * phn
-        self.contribg_gating = Mlp(config.vfeatures, pn, 0.0, "sigmoid")
-        self.projection = Mlp(config.vfeatures, config.out_channels, 0.0, "relu")
+        self.channels_gating = Mlp(config.vfeatures, pn, 0.0, "sigmoid")
+        if config.n_classes is not None:
+            self.logits_gating = Mlp(config.vfeatures, pn, 0.0, "sigmoid")
+            self.logits_projection = Mlp(config.vfeatures, config.n_classes, 0.0, "sigmoid")
+        self.channels_projection = Mlp(config.vfeatures, config.out_channels, 0.0, "relu")
         self.norm = FiltrationBlock(config.out_channels)
-        self.register_buffer("channels_gates", th.zeros((config.out_channels)))
+        self.register_buffer("channels_gates", th.zeros((config.out_channels, )))
+        if config.n_classes is not None:
+            self.register_buffer("logits_gates", th.zeros(config.n_classes, ))
 
-    def _peak_estimation(self, svalues: TensorType["B", "T", "S", "C"]):
-        svalues = svalues * self.channels_gates.view(1, 1, 1, -1)
+    def _peak_estimation(self, svalues: TensorType["B", "T", "S", "C"], 
+                        modality: Literal["channels", "classes"]):
+        assert hasattr(self, f"{modality}_gates")
+        svalues = svalues * getattr(self, f"{modality}_gates").view(1, 1, 1, -1)
         svalues = svalues.max(dim=-2).values
         return svalues
 
@@ -188,21 +194,40 @@ class FuseChannelsHead(nn.Module):
                 result[k] = th.cat(v, dim=1)
 
             return result
-        
+
+    def _gated_forward_impl(self, patch_tokens: TensorType["B", "S", "C"],
+                            tcls_tokens: TensorType["B", "T", "C"],
+                            modality: Literal["channels", "classes"]):
+        (B, N, C) = patch_tokens.shape
+        (_, T, _) = tcls_tokens.shape
+        assert hasattr(self, f"{modality}_gating") \
+            and hasattr(self, f"{modality}_projection"), \
+        (f"wrong chanels modality type: {modality}")
+        contribs = getattr(self, f"{modality}_gating")(tcls_tokens)
+        tokens = patch_tokens.view(B, 1, N, C) * contribs.view(B, T, -1, 1)
+        tokens = (tokens * tcls_tokens.view(B, T, 1, -1))
+        output = getattr(self, f"{modality}_projection")(tokens)
+        output = self._peak_estimation(output, modality)
+        return output
+    
     def _forward_impl(self, patch_tokens: TensorType["B", "S", "C"],
                 tcls_tokens: TensorType["B", "T", "C"],
                 tmask: Optional[TensorType["B", "T"]]=None):
 
-        (B, N, C) = patch_tokens.shape
-        (_, T, _) = tcls_tokens.shape
-        tcls_tokens = (tcls_tokens if tmask is None else tcls_tokens[tmask])
-        contribs = self.contribg_gating(tcls_tokens)
-        tokens = patch_tokens.view(B, 1, N, C) * contribs.view(B, T, -1, 1)
-        tokens = (tokens * tcls_tokens.view(B, T, 1, -1))
-        channels_out = self.projection(tokens)
-        channels_out = self._peak_estimation(channels_out)
+        if (tmask is not None) and (tmask.size(1) == tcls_tokens.size(1)):
+            tcls_tokens = tcls_tokens[tmask]
+        channels_out = self._gated_forward_impl(patch_tokens, 
+                                                tcls_tokens,
+                                                "channels")
+        logits_out = None
+        if (self.config.n_classes is not None) and (self.config.n_classes != 0):
+            logits_out = self._gated_forward_impl(patch_tokens,
+                                                    tcls_tokens,
+                                                    "logits")
         return {"temporal_cls_tokens": tcls_tokens,
-                "channels_output": channels_out}
+                "channels_output": channels_out,
+                "logits_output": logits_out}
+        
     
     def forward(self, patch_tokens: TensorType["B", "S", "C"],
                 tcls_tokens: TensorType["B", "T", "C"],
@@ -222,19 +247,22 @@ class PerceptualTransferModel(nn.Module):
         self.flow_model = FlowModel(config)
         self.fuse_head = FuseChannelsHead(config)
         self.tt_fuse = TimeTransferFusion(config)
+        self.pap = PatchAverageProjection(config)
         self.tt_descrite = TransferInterpolationBlock(config)
 
     def forward(self, patch_tokens: th.Tensor,
                 cls_token: th.Tensor,
-                timestampts: th.Tensor,
+                timestamps: th.Tensor,
                 tmask: Optional[th.BoolTensor | th.LongTensor]=None):
 
         B = cls_token.size(0)
         z0 = self.encoder(cls_token).squeeze()
-        zt_flow = self.flow_model(z0, timestampts, self.cfg.time_chunk_size)
-        zt_descrite = self.tt_descrite(timestampts)
+        zt_flow = self.flow_model(z0, timestamps, self.cfg.time_chunk_size)
+        zt_descrite = self.tt_descrite(timestamps)
         if zt_descrite.ndim == 2:
             zt_descrite = zt_descrite[None, ...].repeat(B, 1, 1)
+        pp = self.pap(patch_tokens)
+        zt_descrite = (pp.view(B, 1, -1) * zt_descrite)
         zt = self.tt_fuse(zt_flow, zt_descrite)
         xt = self.decoder(zt)
         return self.fuse_head(patch_tokens, xt, tmask, self.cfg.time_chunk_size)
@@ -246,7 +274,6 @@ class PatchEmbedding(nn.Module):
     def __init__(self, config: WeightedPerceptualTransferConfig):
         super(PatchEmbedding, self).__init__()
         self.cfg = config
-        # print(config.channels, config.vfeatures, type(config.patch_size), config.patch_size)
         self.conv = nn.Conv2d(config.in_channels, 
                             config.vfeatures,
                             config.patch_size,
@@ -293,8 +320,9 @@ class VisualTransformer(nn.Module):
 
     def forward(self, image: TensorType["B", "C", "W", "H"],
                 get_intermediates: bool=False):
+        (B, C, W, H) = image.shape
         embeddings = self.patch_embed(image)
-        tokens = th.cat([embeddings, self.cls.view(1, 1, -1).repeat(10, 1, 1)], dim=1)
+        tokens = th.cat([embeddings, self.cls.view(1, 1, -1).repeat(B, 1, 1)], dim=1)
         intermediates: Dict[str, th.Tensor | Tuple[th.Tensor]] = {} if get_intermediates else None
         for idx, block in enumerate(self.blocks):
             bout = block(tokens, use_cache=False)
@@ -306,58 +334,189 @@ class VisualTransformer(nn.Module):
                 "cls_token": tokens[:, -1, :],
                 "intermediates": intermediates}
 
+
+class PatchAverageProjection(nn.Module):
+    def __init__(self, config: WeightedPerceptualTransferConfig):
+        super(PatchAverageProjection, self).__init__()
+        self.projection = nn.Sequential(nn.Linear(config.vfeatures, config.lfeatures),
+                                        FiltrationBlock(config.lfeatures))
+
+    def forward(self, patch_tokens: th.Tensor):
+        x = patch_tokens.mean(dim=1)
+        x = self.projection(x)
+        return x
+        
+
 #============================ViT Modelling Part=============================================================
 
 
+@dataclass
+class WPTInput:
+    logits: Optional[TensorType["B", "Cls"]]=None
+    channels: Optional[TensorType["B", "T", "C"]]=None
+    embeddings: Optional[TensorType["B", "C"]]=None
+
 @dataclass 
 class WPTOutput(ModelOutput):
-    loss:                  Optional[th.FloatTensor]=None
-    patch_tokens:          Optional[th.Tensor]=None
-    cls_token:             Optional[th.Tensor]=None
-    intermediates:         Optional[th.Tensor]=None
-    temporal_cls_tokens:   Optional[th.Tensor]=None
-    channels_output:       Optional[th.Tensor]=None
+    loss:                       Optional[th.FloatTensor]=None
+    patch_tokens:               Optional[th.Tensor]=None
+    cls_token:                  Optional[th.Tensor]=None
+    intermediates:              Optional[th.Tensor]=None
+    temporal_cls_tokens:        Optional[th.Tensor]=None
+    channels_output:            Optional[th.Tensor]=None
+    logits_output:              Optional[th.Tensor]=None
     
-    
-
-
 class WeightedPerceptualTransferModel(PreTrainedModel):
     def __init__(self, config: WeightedPerceptualTransferConfig):
         super(WeightedPerceptualTransferModel, self).__init__(config)
+        self.config = config
         self.visual = VisualTransformer(config)
         self.ptrnasnet = PerceptualTransferModel(config)
 
-    def forward(self, image: TensorType["B", "W", "H", "C"],
-                t: Optional[TensorType["B", "Time"]]=None,
-                get_vit_intermediates: bool=False):
+    def forward(self, image:            TensorType["B", "W", "H", "C"],
+                timestamps:            Optional[TensorType["B", "Time"]]=None,
+                inter_timestamps:      Optional[TensorType["Time"]]=None,
+                inter_steps:            Optional[int | th.LongTensor | List[int]]=None,
+                get_vit_intermediates:  bool=False,
+                verbose: bool=True):
         output = self.visual(image, get_vit_intermediates)
-        if t is not None:
+        if timestamps is not None:
             cls_token = output["cls_token"][:, None, :]
             temporal_out = self.ptrnasnet(output["patch_tokens"], 
                                 cls_token,
-                                timestampts=t)
+                                timestamps=timestamps)
             output.update(temporal_out)
+        if inter_timestamps is not None:
+            if inter_steps is not None:
+                output.update(self._forward_inter_impl(output["patch_tokens"],
+                                                    inter_timestamps,
+                                                    inter_steps,
+                                                    verbose))
+            else:
+                output.update(self._forward_inter_impl(output["patch_tokens"],
+                                                    inter_timestamps, 
+                                                    verbose=verbose))
         return WPTOutput(**output)
+
+    def _approximate_impl(self, patch_tokens: TensorType["B", "S", "C"],
+                            timestamps: th.FloatTensor):
+        z0 = self.ptrnasnet.tt_descrite(timestamps[0])
+        bpp = self.ptrnasnet.pap(patch_tokens)
+        (B, C) = bpp.shape
+        z0 = (bpp.view(B, 1, C) * z0.view(1, 1, C))
+        x0 = self.ptrnasnet.decoder(z0)
+        return self.ptrnasnet(patch_tokens, x0, timestamps)
+        
+    def approximate(self, image: TensorType["B", "W", "H", "C"],
+                        timestamps: th.FloatTensor):
+            output = self.visual(image)
+            approx_output = self._approximate_impl(output["patch_tokens"], timestamps)
+            output.update(approx_output)
+            return WPTOutput(**output)
     
+    def interpolate(self, image: TensorType["B", "W", "H", "C"],
+                        timestamps: th.FloatTensor,
+                        steps: int | th.LongTensor | List[int]=100,
+                        verbose: bool=True):
+            output = self.visual(image)
+            patch_tokens = output["patch_tokens"]
+            if isinstance(steps, (th.LongTensor, list)):
+                assert (len(steps) == (timestamps.shape[0] + 1))
+            (tcls_full_stack, channels_full_stack, logits_full_stack) = [], [], []
+            pbar = range(1, len(timestamps))
+            if verbose:
+                pbar = tqdm(pbar, 
+                            desc="Interpolating Values...",
+                            colour="green",
+                            ascii=":-")
+            for tidx in pbar:
+                lsteps = (steps if isinstance(steps, int) else steps[tidx - 1])
+                times = th.linspace(timestamps[tidx - 1], timestamps[tidx], lsteps)
+                fuse_output = self._approximate_impl(patch_tokens, times)
+                tcls_full_stack.append(fuse_output["temporal_cls_tokens"])
+                channels_full_stack.append(fuse_output["channels_output"])
+                logits = fuse_output["logits_output"]
+                if logits is not None:
+                    logits_full_stack.append(logits)
+                    
+            output.update({"temporal_cls_tokens": th.cat(tcls_full_stack, dim=1),
+                            "channels_output": th.cat(channels_full_stack, dim=1),
+                            "logits_output": th.cat(logits_full_stack, dim=1) 
+                                            if len(logits_full_stack) != 0 else None})
+            return WPTOutput(**output)
+
+
+
+# ========================<metrics & losses>==============================================
+class WPTCriterionModel(nn.Module):
+    def __init__(self, config: WeightedPerceptualTransferConfig):
+        super(WPTCriterionModel, self).__init__()
+        self.reg_loss = nn.MSELoss()
+        if (config.n_classes is not None) and (config.n_classes != 0):
+            self.cls_loss = nn.CrossEntropyLoss()
+            (self.tp, self.tn) = (0.0, 0.0)
+            (self.fp, self.fn) = (0.0, 0.0)
+    def _get_classification_stats(self, logits: th.tensor, 
+                    labels: th.Tensor, 
+                    tau: float=0.45):
+        preds = (logits > tau).float()
+        self.tp += ((preds == 1) & (labels == 1)).sum().float().item()
+        self.tn += ((preds == 0) & (labels == 0)).sum().float().item()
+        self.fp += ((preds == 1) & (labels == 0)).sum().float().item()
+        self.fn += ((preds == 0) & (labels == 1)).sum().float().item()
+
+    def get_classification_stats(self, empty: bool=True):
+        output = {"tp": self.tp,
+                "tn": self.tn,
+                "fp": self.fp,
+                "fn": self.fn}
+        if empty:
+            for k in output.keys():
+                setattr(self, k, 0)
+        return output
+        
+    def forward(self, wpt_output: WPTOutput, 
+                channels: th.Tensor,
+                logits: Optional[th.Tensor]=None):
+        output = dict()
+        loss = th.tensor(0)
+        reg_loss = self.reg_loss(wpt_output["channels_output"], channels)
+        output.update({"reg": reg_loss})
+        loss += reg_loss
+        if logits is not None:
+            if wpt_output["logits_output"] is not None:
+                logits_loss = self.cls_loss(wpt_output["logits_output"], logits)
+                output.update({"classification": logits_loss})
+                loss += logits_loss
+            else:
+                warn("logits loss will work only if " \
+                "config.n_classes is not None or not equale to 0")
+        output.update({"loss": loss})
+        return output
+
+        
 if __name__ == "__main__":
     config = WeightedPerceptualTransferConfig(in_channels=3, 
                                             out_channels=13,
                                             visual_features=312,
                                             image_size=448,
-                                            time_chunk_size=54)
+                                            time_chunk_size=54,
+                                            n_classes=32)
     # tgrid = TransferInterpolationBlock(config)
     # times = th.normal(0, 1, (10, 100))
     # tfeatures = tgrid(times)
     # print(tfeatures.shape)
     model = WeightedPerceptualTransferModel(config)
-    print(f"Ntotal: {sum([p.numel() for p in model.parameters()])}")
     data = th.normal(0, 1, (10, 3, 448, 448))
-    times = th.linspace(0, 1, 1000)
-    # times = times[None, :].repeat(10, 1)
-    out = model(data, times)
-    print(out.patch_tokens.shape,
-        out.temporal_cls_tokens.shape,
-        out.channels_output.shape)
+    # times = th.linspace(0, 1, 1000)
+    # out = model(data, times)
+
+    times = th.linspace(0.012, 0.3, 100)
+    out = model.approximate(data, times)
+    print(out.logits_output.shape,
+        out.channels_output.shape,
+        out.patch_tokens.shape,
+        out.temporal_cls_tokens.shape)
     
-    # print(fout.fused_features.shape, fout.signal_values.shape)
+    # print(fout.fused_features.shape, fout.waves.shape)
     

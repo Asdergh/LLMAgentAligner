@@ -100,7 +100,7 @@ class AdditiveAttention(BaseAttenionScoring):
         (_, _, Sk, _) = keys.size()
         assert (S == Sk), \
         (f"""for additive scoring sequence_lenghts 
-         for query and keys must be the same""") 
+        for query and keys must be the same""") 
         print(self.qnet(query).size(), self.knet(keys).size())
         QK = F.tanh(self.qnet(query) + self.knet(keys))
         scores = (self.projection\
@@ -116,10 +116,10 @@ class AdditiveAttention(BaseAttenionScoring):
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, features: int,
-                 nheads: int,
-                 scoring_fn: str="scaled-dot-product",
-                 heads_reduction: Literal["sum", "mean", "w-sum"]="w-sum",
-                 layer_idx: Optional[int]=None):
+                nheads: int,
+                scoring_fn: str="scaled-dot-product",
+                heads_reduction: Literal["sum", "mean", "w-sum"]="w-sum",
+                layer_idx: Optional[int]=None):
         
         super(MultiHeadAttention, self).__init__()
         assert (features % nheads) == 0, \
