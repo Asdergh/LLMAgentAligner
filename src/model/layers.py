@@ -2,7 +2,7 @@ import torch as th
 import torch.nn as nn
 import transformers as tfs
 import transformers.modeling_utils as tfm
-from typing import (Optional, Callable, Dict, List, Tuple)
+from typing import (Optional, Callable, Dict, List, Tuple, Union)
 from warnings import warn
 from functools import wraps
 from dataclasses import dataclass, asdict
@@ -21,6 +21,13 @@ class BlockOutput:
 class BlockStackOutput:
     last_features: Optional[th.Tensor]=None
     hidden_features: Optional[th.Tensor | Tuple[th.Tensor]]=None
+    past_key_values: Optional[Cache]=None
+
+@dataclass
+class TransoformerOutput:
+    last_features: Optional[th.Tensor]=None
+    hidden_features: Optional[Tuple[th.Tensor]]=None
+    intermediates: Optional[Tuple[th.Tensor]]=None
     past_key_values: Optional[Cache]=None
 
 def get_activation(act: str, **kwargs) -> Callable[..., nn.Module]:
@@ -192,6 +199,50 @@ class BlockStack(nn.Module):
         return BlockStackOutput(x, 
                                 tuple(hidden_features), 
                                 past_key_values)
+
+class Transformer(nn.Module):
+    def __init__(self, 
+                features: int,
+                aggregation_depth: int=2,
+                blocks_depth: int=3,
+                n_attn_heads: int=4,
+                dropout: float=0.23,
+                activation: Union[str, List[str]]="relu",
+                attention_reduction: str="w-sum",
+                residual_connections: bool=False):
+
+        super(Transformer, self).__init__()
+        self._block_stacks: nn.ModuleList = []
+        for idx in range(aggregation_depth):
+            actiavtion = actiavtion                    \
+                    if isinstance(actiavtion, str)      \
+                    else activation[idx]
+            stack = BlockStack(features,
+                                blocks_depth,
+                                dropout,
+                                activation,
+                                True, n_attn_heads,
+                                attention_reduction,
+                                residual_connections=residual_connections,
+                                last_layer_idx=(idx*aggregation_depth))
+            self._bock_stacks.append(stack)
+
+    def forward(self, 
+                tokens: th.Tensor,
+                attn_mask: Optional[th.LongTensor]=None):
+        stack_hiddens = []
+        intermediates = []
+        x = tokens
+        for stack in self._block_stacks:
+            stack_output = stack(x)
+            intermediates.append(stack_output.last_features)
+            stack_hiddens += stack_output.hidden_features
+            x = stack_output.last_features
+        return TransoformerOutput(last_features=x,
+                                    intermediates=intermediates,
+                                    hidden_features=stack_hiddens)
+        
+        
 
 
 class FusionEnterBlock(nn.Module):

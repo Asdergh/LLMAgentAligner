@@ -36,7 +36,8 @@ def _reward_config(config_cls: PretrainedConfig):
                     dropout: float=0.23,
                     chunk_size: int=32,
                     chunk_reduction: Literal["weighted", "mean", "sum"]="weighted",
-                    num_labels: int=1):
+                    num_labels: int=1,
+                    labels_activavions: str="softmax"):
             super(Wrapper, self).__init__()
             self.features_chunk = features_chunk
             self.activations = activations
@@ -61,7 +62,7 @@ def _reward_module(model: PretrianedModel):
                 get_activation(self.cfg.actiavtions)
             )
             self._weights = nn.Sequential(
-                nn.Linear(self.cfg.features_chunk, 1),
+                nn.Linear(self._cfg*self._d, 1),
                 get_activation("tanh")
             )
             self._aggregation = BlockStack(features=(self._cs * self._d),
@@ -73,22 +74,29 @@ def _reward_module(model: PretrianedModel):
                                         attention_reduction=self.cfg.aa_attention_reduction,
                                         attention_scoring_fn=self.cfg.aa_attention_scoring_fn)
             self._head = nn.Sequential(
-                nn.Linear(self.cfg.features_chunk, self.cfg.num_labels),
-                get_activation("tanh")
+                nn.Linear(self._cs*self._d, self.cfg.num_labels),
+                get_activation(self.cfg.labels_activation)
             )
 
         def chunk_sequence(self, x: th.Tensor):
             """Chunk Sequential Tensor with tokens."""
-            chunks = []
-            n = (x.shape[1] / self._cs)
-            for idx in range(int(n)):
-                chunk = x[:, idx*self._cfg: (idx + 1)*self._cfg, :]
-                chunks.append(chunk)
-            if (n % 1) != 0:
-                chunk = x[:, n*self._cs:, :]
-                chunks.append(chunk)
-
-            chunks = th.stack()
+            if x.shape[1] > self._cs:
+                chunks = []
+                B = x.shape[0]
+                n = (x.shape[1] / self._cs)
+                for idx in range(int(n)):
+                    chunk = x[:, idx*self._cfg: (idx + 1)*self._cfg, :]
+                    chunk = self._chunk_projection(chunk)
+                    chunks.append(chunk)
+                if (n % 1) != 0:
+                    chunk = x[:, n*self._cs:, :]
+                    chunk = th.pad(chunk, (0, 0, 0, self._cs - chunk.shape[1]))
+                    chunk = self._chunk_projection(chunk)
+                    chunks.append(chunk)
+                chunks = th.stack(chunks, axis=1)
+                return chunk.view(B, n, -1)
+            else:
+                return self._chunk_projection(x)
                 
         def forward(self, 
                     input_ids: th.LongTensor,
@@ -98,6 +106,23 @@ def _reward_module(model: PretrianedModel):
             embeddings = self._backbone(input_ids=input_ids,
                                         attention_mask=attention_mask,
                                         **kwargs)
+            tokens = embeddings.last_hidden_state
+            tokens = self.chunk_sequence(tokens)
+            tokens = self._aggregation(tokens)
+
+            weights = self._weights(tokens)
+            if self.cfg.chunk_reduction == "mean":
+                result = (tokens * weights).mean(dim=1)
+            elif self.cfg.chunk_reduction == "sum":
+                result = (tokens * weights).sum(dim1=1)
+            elif self.cfg.chunk_reduction == "weighted":
+                weights = Fn.softmax(weights, dim=-1)
+                result = (tokens * weights).sum(dim1=1)
+            else:
+                raise ValueError(f"unknown reduction type: {self.cfg.chunk_reduction}")
+            return self._head(result)
+    return Wrapper
+            
 
 
 if __name__ == "__main__":
