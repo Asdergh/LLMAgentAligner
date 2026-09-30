@@ -29,98 +29,12 @@ def create_reward_module(backbone: str):
 
 
 def _reward_config(config_cls: PretrainedConfig):
-    class Wrapper(config_cls):
-        def __init__(self, 
-                    features_chunk: int=256,
-                    activations: Literal["relu", "gelu"]="relu",
-                    dropout: float=0.23,
-                    chunk_size: int=32,
-                    chunk_reduction: Literal["weighted", "mean", "sum"]="weighted",
-                    num_labels: int=1,
-                    labels_activavions: str="softmax"):
-            super(Wrapper, self).__init__()
-            self.features_chunk = features_chunk
-            self.activations = activations
-            self.dp = dropout
-            self.chunk_size = chunk_size
-            self.chunk_reduction = chunk_reduction
-            self.num_labels = num_labels
+    
     return Wrapper
         
 def _reward_module(model: PretrianedModel):
         
-    class Wrapper(PretrianedModel):
-        def __int__(self, config: PretrainedConfig):
-            super(Wrapper, self).__init__()
-            self._cs = config.chunk_size
-            self._d = config.features_chunk
-            self.config = config
-            self._backbone: PretrianedModel = model
-            self._chunk_projection = nn.Sequential(
-                nn.Linear(self.config.featuers, self._d),
-                nn.LayerNorm(self._d),
-                get_activation(self.cfg.actiavtions)
-            )
-            self._weights = nn.Sequential(
-                nn.Linear(self._cfg*self._d, 1),
-                get_activation("tanh")
-            )
-            self._aggregation = BlockStack(features=(self._cs * self._d),
-                                        depth=self.cfg.aa_aggregation_depth,
-                                        dropout=self.cfg.aa_dp,
-                                        activation=self.cfg.aa_actiavtions,
-                                        filtration=self.cfg.aa_filtration,
-                                        n_attn_heads=self.cfg.aa_n_att_heads,
-                                        attention_reduction=self.cfg.aa_attention_reduction,
-                                        attention_scoring_fn=self.cfg.aa_attention_scoring_fn)
-            self._head = nn.Sequential(
-                nn.Linear(self._cs*self._d, self.cfg.num_labels),
-                get_activation(self.cfg.labels_activation)
-            )
-
-        def chunk_sequence(self, x: th.Tensor):
-            """Chunk Sequential Tensor with tokens."""
-            if x.shape[1] > self._cs:
-                chunks = []
-                B = x.shape[0]
-                n = (x.shape[1] / self._cs)
-                for idx in range(int(n)):
-                    chunk = x[:, idx*self._cfg: (idx + 1)*self._cfg, :]
-                    chunk = self._chunk_projection(chunk)
-                    chunks.append(chunk)
-                if (n % 1) != 0:
-                    chunk = x[:, n*self._cs:, :]
-                    chunk = th.pad(chunk, (0, 0, 0, self._cs - chunk.shape[1]))
-                    chunk = self._chunk_projection(chunk)
-                    chunks.append(chunk)
-                chunks = th.stack(chunks, axis=1)
-                return chunk.view(B, n, -1)
-            else:
-                return self._chunk_projection(x)
-                
-        def forward(self, 
-                    input_ids: th.LongTensor,
-                    attention_mask: th.LongTensor=None,
-                    **kwargs):
-
-            embeddings = self._backbone(input_ids=input_ids,
-                                        attention_mask=attention_mask,
-                                        **kwargs)
-            tokens = embeddings.last_hidden_state
-            tokens = self.chunk_sequence(tokens)
-            tokens = self._aggregation(tokens)
-
-            weights = self._weights(tokens)
-            if self.cfg.chunk_reduction == "mean":
-                result = (tokens * weights).mean(dim=1)
-            elif self.cfg.chunk_reduction == "sum":
-                result = (tokens * weights).sum(dim1=1)
-            elif self.cfg.chunk_reduction == "weighted":
-                weights = Fn.softmax(weights, dim=-1)
-                result = (tokens * weights).sum(dim1=1)
-            else:
-                raise ValueError(f"unknown reduction type: {self.cfg.chunk_reduction}")
-            return self._head(result)
+    
     return Wrapper
             
 

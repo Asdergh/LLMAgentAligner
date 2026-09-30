@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from queue import Queue
-from .configuration_wpt import WeightedPerceptualTransferConfig
+# from .configuration_wpt import WeightedPerceptualTransferConfig
 from ..layers import *
 from ..attention import MultiHeadAttention
 from typing import Any, Literal
@@ -13,6 +13,66 @@ from transformers.utils import ModelOutput
 from tqdm import tqdm
 
 
+
+
+
+
+
+# ================ CONFIGURATION ===============================
+from transformers import PretrainedConfig
+from typing import (Optional, Dict, Tuple, Literal, Union)
+
+
+class WeightedPerceptualTransferConfig(PretrainedConfig):
+    model_type = "temporal-shared-attention"
+    def __init__(self,
+                ode_solver:          str="default",
+                in_channels:         int=1,
+                out_channels:        int=1,
+                time_chunk_size:     int=32,
+                tinterpolation_size: int=100,
+                image_size:          Union[int, Tuple[int, int]]=224,
+                visual_features:     int=364,
+                patch_size:          Union[int, Tuple[int]]=14,
+                latent_features:     int=64,
+                latent_act_fn:       str="gelu",
+                visual_act_fn:       str="gelu",
+                aggregation_depth:   int=3,
+                block_depth:         int=2,
+                use_adanorm:         bool=True,
+                time_reduction:      Literal["mean", "sum", "w-sum"]="w-sum",
+                attention_reduction: Literal["mean", "sum", "w-sum"]="w-sum",
+                attention_scoring:   str="scaled-dot-product",
+                attention_heads:     int=4,
+                signal_splits_n:     int=5,
+                skip_connections:    bool=False,
+                n_classes:           Optional[int]=None, 
+                **kwargs):
+
+        self.ode_solver = ode_solver
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.time_chunk_size = time_chunk_size
+        self.tinterpolation_size = tinterpolation_size
+        self.image_size = image_size if isinstance(image_size, tuple) else (image_size, image_size)
+        self.lfeatures = latent_features
+        self.vfeatures = visual_features
+        self.patch_size = patch_size if isinstance(patch_size, tuple) else (patch_size, patch_size)
+        self.aggregation_depth = aggregation_depth
+        self.block_depth = block_depth
+        self.use_adanorm = use_adanorm
+        self.lact_fn = latent_act_fn
+        self.vact_fn = visual_act_fn
+        self.time_reduction = time_reduction
+        self.signal_splits_n = signal_splits_n
+        self.attention_reduction = attention_reduction
+        self.attention_scoring = attention_scoring
+        self.attention_heads = attention_heads
+        self.skip = skip_connections
+        self.n_classes = n_classes
+        super(WeightedPerceptualTransferConfig, self).__init__(**kwargs)
+
+# ================ CONFIGURATION ===============================
 
 
 #============================Perceptual Fusion Modeling Part=============================================================
@@ -74,8 +134,10 @@ class FlowModel(nn.Module):
 class TransferInterpolationBlock(nn.Module):
     def __init__(self, config: WeightedPerceptualTransferConfig):
         super(TransferInterpolationBlock, self).__init__()
-        tweights = th.zeros((1, config.lfeatures, config.tinterpolation_size, 1))
-        self.register_buffer("time_weights", tweights)
+        self.time_weights = nn.Parameter(th.zeros((1, 
+                                        config.lfeatures, 
+                                        config.tinterpolation_size, 1))\
+                                        .requires_grad_(True))
 
     def forward(self, t: TensorType["B", "T"]):
         if t.ndim == 0 or (t.ndim == 1 or t.shape[0] == 1):
@@ -269,6 +331,8 @@ class PerceptualTransferModel(nn.Module):
 #============================<(Perceptual Fusion Modeling Part)>=============================================================
 
 
+
+
 #============================ViT Modelling Part=============================================================
 class PatchEmbedding(nn.Module):
     def __init__(self, config: WeightedPerceptualTransferConfig):
@@ -315,8 +379,8 @@ class VisualTransformer(nn.Module):
                     config.skip)
             for _ in range(config.aggregation_depth)
         ])
-        cls_token = th.zeros((config.vfeatures, ))
-        self.register_buffer("cls", cls_token)
+        self.cls = nn.Parameter(th.zeros((config.vfeatures, ))\
+                                .requires_grid_(True))
 
     def forward(self, image: TensorType["B", "C", "W", "H"],
                 get_intermediates: bool=False):
@@ -335,6 +399,7 @@ class VisualTransformer(nn.Module):
                 "intermediates": intermediates}
 
 
+    
 class PatchAverageProjection(nn.Module):
     def __init__(self, config: WeightedPerceptualTransferConfig):
         super(PatchAverageProjection, self).__init__()
@@ -345,7 +410,7 @@ class PatchAverageProjection(nn.Module):
         x = patch_tokens.mean(dim=1)
         x = self.projection(x)
         return x
-        
+
 
 #============================ViT Modelling Part=============================================================
 
@@ -358,7 +423,6 @@ class WPTInput:
 
 @dataclass 
 class WPTOutput(ModelOutput):
-    loss:                       Optional[th.FloatTensor]=None
     patch_tokens:               Optional[th.Tensor]=None
     cls_token:                  Optional[th.Tensor]=None
     intermediates:              Optional[th.Tensor]=None
@@ -398,8 +462,10 @@ class WeightedPerceptualTransferModel(PreTrainedModel):
                                                     verbose=verbose))
         return WPTOutput(**output)
 
-    def _approximate_impl(self, patch_tokens: TensorType["B", "S", "C"],
-                            timestamps: th.FloatTensor):
+    def _approximate_impl(self, 
+                        patch_tokens: TensorType["B", "S", "C"],
+                        timestamps: th.FloatTensor):
+        
         z0 = self.ptrnasnet.tt_descrite(timestamps[0])
         bpp = self.ptrnasnet.pap(patch_tokens)
         (B, C) = bpp.shape
@@ -407,17 +473,21 @@ class WeightedPerceptualTransferModel(PreTrainedModel):
         x0 = self.ptrnasnet.decoder(z0)
         return self.ptrnasnet(patch_tokens, x0, timestamps)
         
-    def approximate(self, image: TensorType["B", "W", "H", "C"],
-                        timestamps: th.FloatTensor):
+    def approximate(self, 
+                    image: TensorType["B", "W", "H", "C"],
+                    timestamps: th.FloatTensor):
+            
             output = self.visual(image)
             approx_output = self._approximate_impl(output["patch_tokens"], timestamps)
             output.update(approx_output)
             return WPTOutput(**output)
     
-    def interpolate(self, image: TensorType["B", "W", "H", "C"],
-                        timestamps: th.FloatTensor,
-                        steps: int | th.LongTensor | List[int]=100,
-                        verbose: bool=True):
+    def interpolate(self, 
+                    image: TensorType["B", "W", "H", "C"],
+                    timestamps: th.FloatTensor,
+                    steps: int | th.LongTensor | List[int]=100,
+                    verbose: bool=True):
+            
             output = self.visual(image)
             patch_tokens = output["patch_tokens"]
             if isinstance(steps, (th.LongTensor, list)):
@@ -447,76 +517,80 @@ class WeightedPerceptualTransferModel(PreTrainedModel):
 
 
 
-# ========================<metrics & losses>==============================================
-class WPTCriterionModel(nn.Module):
-    def __init__(self, config: WeightedPerceptualTransferConfig):
-        super(WPTCriterionModel, self).__init__()
-        self.reg_loss = nn.MSELoss()
-        if (config.n_classes is not None) and (config.n_classes != 0):
-            self.cls_loss = nn.CrossEntropyLoss()
-            (self.tp, self.tn) = (0.0, 0.0)
-            (self.fp, self.fn) = (0.0, 0.0)
-    def _get_classification_stats(self, logits: th.tensor, 
-                    labels: th.Tensor, 
-                    tau: float=0.45):
-        preds = (logits > tau).float()
-        self.tp += ((preds == 1) & (labels == 1)).sum().float().item()
-        self.tn += ((preds == 0) & (labels == 0)).sum().float().item()
-        self.fp += ((preds == 1) & (labels == 0)).sum().float().item()
-        self.fn += ((preds == 0) & (labels == 1)).sum().float().item()
 
-    def get_classification_stats(self, empty: bool=True):
-        output = {"tp": self.tp,
-                "tn": self.tn,
-                "fp": self.fp,
-                "fn": self.fn}
-        if empty:
-            for k in output.keys():
-                setattr(self, k, 0)
-        return output
-        
-    def forward(self, wpt_output: WPTOutput, 
-                channels: th.Tensor,
-                logits: Optional[th.Tensor]=None):
-        output = dict()
-        loss = th.tensor(0)
-        reg_loss = self.reg_loss(wpt_output["channels_output"], channels)
-        output.update({"reg": reg_loss})
-        loss += reg_loss
-        if logits is not None:
-            if wpt_output["logits_output"] is not None:
-                logits_loss = self.cls_loss(wpt_output["logits_output"], logits)
-                output.update({"classification": logits_loss})
-                loss += logits_loss
-            else:
-                warn("logits loss will work only if " \
-                "config.n_classes is not None or not equale to 0")
-        output.update({"loss": loss})
-        return output
 
-        
 if __name__ == "__main__":
     config = WeightedPerceptualTransferConfig(in_channels=3, 
                                             out_channels=13,
                                             visual_features=312,
                                             image_size=448,
                                             time_chunk_size=54,
-                                            n_classes=32)
-    # tgrid = TransferInterpolationBlock(config)
-    # times = th.normal(0, 1, (10, 100))
-    # tfeatures = tgrid(times)
-    # print(tfeatures.shape)
-    model = WeightedPerceptualTransferModel(config)
-    data = th.normal(0, 1, (10, 3, 448, 448))
-    # times = th.linspace(0, 1, 1000)
-    # out = model(data, times)
+                                            n_classes=32,
+                                            latent_features=32)
 
-    times = th.linspace(0.012, 0.3, 100)
-    out = model.approximate(data, times)
-    print(out.logits_output.shape,
-        out.channels_output.shape,
-        out.patch_tokens.shape,
-        out.temporal_cls_tokens.shape)
+
+
+
+    def get_encoder(config):
+        return nn.Sequential(
+            nn.Linear(config.in_channels, config.latent_features),
+            nn.LayerNorm(config.latent_features),
+            nn.ReLU()
+        )
+    def get_head(config):
+        return nn.Sequential(
+            nn.Linear(config.latent_featuers, config.out_channels),
+            nn.LayerNorm(config.out_channels),
+            nn.Tanh()
+        )
+
+    def get_dataset(times: int=10000, 
+                    t_chunk_size: int=100, 
+                    a: float=0.0, b:float=1.0):
+        class DatasetWrapper(th.utils.data.Dataset):
+            def __init__(self):
+                self.t_chunk_size = times
+                self.t_chunks = t_chunk_size
+                self._times = th.linspace(a, b, times)
+
+            def __len__(self):
+                chunks_n = self._times.shape[0] / self.t_chunks
+                if chunks_n % 1 != 0:
+                    chunks_n = int(chunks_n) + 1
+                else:
+                    return int(chunks_n)
+
+            def __getitem__(self, idx: int):
+                if idx == len(self):
+                    if (self._times.shape[0] % self.t_chunks) != 0:
+                        tchunk = self._times[idx*self.t_chunks: ]
+                        tchunk = th.pad(tchunk, (0, self.t_chunk_size - tchunk.shape[0]), tchunk[-1])
+                    else:
+                        tchunk = self._times[idx*]
     
-    # print(fout.fused_features.shape, fout.waves.shape)
-    
+    a = [0, 0.5, 1.0]
+    times = th.stack([
+        th.linspace(a[i - 1], a[i], 100)
+        for i in range(1, len(a))
+    ])
+    model = TransferInterpolationBlock(config)
+    th.nn.init.kaiming_normal_(model.time_weights, nonlinearity="relu")
+    tcls = model(times)
+    # cls = th.normal(0,1, (2, 32))
+    # print(cls.shape, times.shape)
+    # model = FlowModel(config)
+    # tcls = model(cls, times)
+
+    simple_head = get_head(config)
+    dataset = th.
+    import matplotlib.pyplot as plt
+    plt.style.use("dark_background")
+    _, axis = plt.subplots(nrows=3)
+    for idx, color in enumerate(["green", "blue"]):
+        print(tcls[idx, ...].shape)
+        axis[idx].plot(tcls[idx, ...].mean(dim=1).detach(), c=color)
+    plt.show()
+
+
+
+
