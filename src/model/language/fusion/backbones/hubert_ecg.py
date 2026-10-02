@@ -28,67 +28,28 @@ from transformers import AutoModel
 from ..backbone_registry import register_backbone, get_backbone
 from torchtyping import TensorType
 from typing import Optional, Callable, Iterable
+from transformers import AutoModel
 
 
-class ChunkedTensor:
-    def __init__(self, 
-                input: th.Tensor, 
-                chunk_size: int, 
-                dim: int=1,
-                chunk_transform_fn: Optional[Callable]=None):
-        dim = dim % input.ndim
-        def get_chunk(sidx: int, eidx: None):
-            """get correct chunk from input tensor. """
-            order = tuple(slice(None) 
-                        if (i != dim) 
-                        else slice(sidx, eidx) 
-                        for i in range(input.ndim))
-            return input[order].clone()
-        self._stack = []
-        self.chunk_transform_fn = chunk_transform_fn
-        self.n = input.shape[dim] // chunk_size
-        self.chunk_tail_size = input.shape[dim] % chunk_size
-        if self.chunk_tail_size != 0:
-            chunk_tail = get_chunk(self.n*chunk_size)
-            pad_order = [0] * (2 * input.ndim)
-            pad_order[2 * (input.ndim - 1 - dim) + 1] = chunk_size - self.chunk_tail_size
-            chunk_tail = th.pad(chunk_tail, pad_order)
-            if self.chunk_transform_fn is not None:
-                chunk_tail = self.chunk_trnasform_fn(chunk_tail)
-        for idx in range(self.n):
-            chunk = get_chunk(idx*chunk_size, (idx + 1)*chunk_size)
-            if self.chunk_transform_fn:
-                chunk = self.chunk_transform_fn(chunk)
-            self._stack.append(chunk)
-        if self.chunk_tail_size:
-            self._stack.append(chunk_tail)
+@register_backbone("huber-ecg-base", overwrite=True)
+class HuberBaseBackbone(nn.Module):
+    repo_id: str = "Edoardo-BS/hubert-ecg-base"
+    embedding_dim: int = 768
+    def __init__(self):
+        super(HuberBaseBackbone, self).__init__()
+        self._core = AutoModel.from_pretrained(self.repo_id)
 
-    def __len__(self):
-        return self.n \
-                if self.chunk_tail_size == 0 \
-                else self.n + 1
-    
-    def __getitem__(self, idx: int):
-        return self._stack[idx]
-
-    def __iter__(self):
-        return iter(self._stack) 
-    
-def input_processor(inputs: TensorType["B", "C", "T"]):
-    def chunk_view_fn(chunk: TensorType["B", "C", "T"]):
-        return chunk.flatten(start_dim=-2)
-    return ChunkedTensor(inputs, 
-                        dim=-1, 
-                        chunk_size=500,
-                        chunk_transform_fn=chunk_view_fn)
-
-def output_processor(features: Iterable):
-    
-
-register_backbone("hubert-ecg-base",
-                    embedding_dim=768,
-                    repo="Edoardo-Coppola/hubert-ecg-base",
-                    preprocessor=input_processor)
+    def forward(self, x: th.Tensor):
+        """Huber model have padded_output field
+        that models hadnles general features representations 
+        about all raw signals that was passed as input.
+        
+        The input x: th.Tensor must have form: [B, 12, Times].
+        """
+        B = x.shape[0]
+        x = x.flatten(start_dim=-2)
+        x = self._core(x)
+        return x.last_hidden_state
 
 
 

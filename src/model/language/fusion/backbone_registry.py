@@ -36,18 +36,18 @@ def get_backbone(
     backbone_kwargs: Optional[dict]=None,
     **kwargs
 ):
-    """Instantiate a registered backbone and wrap it into ``BackboneWrapper``.
+    """Instantiate a registered backbone and wrap it into ``BackBoneWrapper``.
     Args:
         name: Key of the backbone registered with ``register_backbone``.
         features_dim: Output size of the projection head.
         backbone_kwargs: Keyword arguments for the backbone class constructor.
-        **kwargs: Extra arguments for ``BackboneWrapper`` (``activation``,
+        **kwargs: Extra arguments for ``BackBoneWrapper`` (``activation``,
             ``pre_dp``, ``post_dp``, ``filtration``).
     Notes:
         Constructor arguments of the backbone and of the wrapper are passed
         separately, so they never collide.
     Returns:
-        BackboneWrapper: Wrapper around the built backbone.
+        BackBoneWrapper: Wrapper around the built backbone.
     Raises:
         KeyError: If ``name`` is not registered.
         ValueError: If the backbone class failed to instantiate.
@@ -60,12 +60,11 @@ def get_backbone(
         backbone = cls(**(backbone_kwargs or {}))
     except Exception as e:
         raise ValueError(f"Failed to build backbone '{name}': {e}") from e
-    return BackboneWrapper(features_dim=features_dim,
+    return BackBoneWrapper(features_dim=features_dim,
                             backbone=backbone,
                             **kwargs)
 
-
-class BackboneWrapper(nn.Module):
+class BackBoneWrapper(nn.Module):
     """Frozen backbone with a trainable projection head.
     Data flow::
         x -> backbone -> head -> filter -> out
@@ -96,7 +95,7 @@ class BackboneWrapper(nn.Module):
                 pre_dp: float=0.01,
                 post_dp: float=0.00,
                 filtration: bool=False):
-        super(BackboneWrapper, self).__init__()
+        super(BackBoneWrapper, self).__init__()
         if not isinstance(backbone, nn.Module):
             raise ValueError(f"Unsupported backbone type: {type(backbone)}. "
                             "Expected nn.Module.")
